@@ -5,64 +5,33 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json());
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY; // add this in Render environment variables
 
-// Strict regex — requires a real TLD, rejects image extensions and paths
-const EMAIL_REGEX = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 const IMAGE_EXTENSIONS = /\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff?|avif|mp4|mp3|css|js|woff2?|eot|ttf)$/i;
 const EXCLUDE_DOMAINS = [
   'sentry.io','wixpress.com','squarespace.com','shopify.com',
   'example.com','domain.com','email.com','yoursite.com','yourdomain.com',
-  'cloudinary.com','amazonaws.com','cloudfront.net','imgix.net'
+  'cloudinary.com','amazonaws.com','cloudfront.net','imgix.net',
+  'googleusercontent.com','googleapis.com','gstatic.com'
 ];
 
 function isValidEmail(str) {
-  if (!str) return false;
+  if (!str || typeof str !== 'string') return false;
+  str = str.trim();
   const parts = str.split('@');
   if (parts.length !== 2) return false;
   const [local, domain] = parts;
   if (!local || local.length > 64 || /[\s\/\\]/.test(local)) return false;
   if (!domain.includes('.') || /[\/\\]/.test(domain)) return false;
-  if (IMAGE_EXTENSIONS.test(domain)) return false; // catches flags@2x.webp etc.
-  const excluded = EXCLUDE_DOMAINS.some(ex => domain.toLowerCase().includes(ex));
-  if (excluded) return false;
+  if (IMAGE_EXTENSIONS.test(domain)) return false;
+  if (EXCLUDE_DOMAINS.some(ex => domain.toLowerCase().includes(ex))) return false;
   return /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/.test(str);
 }
 
 // ── HEALTH CHECK ──
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'LaunchX Email Scraper' }));
-
-// ── ANTHROPIC PROXY ──
-// Forwards requests to the Anthropic API, attaching your secret key server-side.
-// The frontend never sees ANTHROPIC_API_KEY.
-app.post('/anthropic-proxy', async (req, res) => {
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set in Render environment variables' });
-  }
-  try {
-    const response = await axios.post(
-      'https://api.anthropic.com/v1/messages',
-      req.body,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-          'anthropic-beta': 'web-search-2025-03-05'
-        },
-        timeout: 60000 // 60s — AI calls can take a moment
-      }
-    );
-    res.json(response.data);
-  } catch (err) {
-    const status = err.response?.status || 500;
-    const message = err.response?.data || { error: err.message };
-    res.status(status).json(message);
-  }
-});
 
 // ── SEARCH GOOGLE MAPS ──
 app.post('/search-maps', async (req, res) => {
@@ -82,7 +51,11 @@ app.post('/search-maps', async (req, res) => {
     for (const place of places) {
       try {
         const detailRes = await axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
-          params: { place_id: place.place_id, fields: 'name,formatted_phone_number,website,formatted_address', key: GOOGLE_API_KEY }
+          params: {
+            place_id: place.place_id,
+            fields: 'name,formatted_phone_number,website,formatted_address',
+            key: GOOGLE_API_KEY
+          }
         });
         const d = detailRes.data.result;
         businesses.push({
@@ -134,27 +107,50 @@ app.post('/scrape-batch', async (req, res) => {
 // ── HELPER: scrape emails from a site ──
 async function scrapeEmailsFromSite(url) {
   const base = url.replace(/\/$/, '');
-  const pages = [base, base + '/contact', base + '/about'];
+  // Check homepage + common contact pages
+  const pages = [
+    base,
+    base + '/contact',
+    base + '/contact-us',
+    base + '/about',
+    base + '/about-us'
+  ];
   const found = new Set();
 
   for (const page of pages) {
     try {
       const response = await axios.get(page, {
         timeout: 8000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EmailFinder/1.0)' },
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        },
         maxRedirects: 3
       });
       const html = response.data;
       const $ = cheerio.load(html);
-      $('script, style').remove();
-      const text = $.text() + ' ' + html;
 
-      const matches = text.match(EMAIL_REGEX) || [];
-      matches.forEach(e => {
+      // Remove noise
+      $('script, style, noscript, img, svg').remove();
+
+      // Check visible text first
+      const text = $.text();
+      const rawHtml = html;
+
+      // Also decode mailto: links which often have obfuscated emails
+      $('a[href^="mailto:"]').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        const email = href.replace('mailto:', '').split('?')[0].trim();
+        if (isValidEmail(email)) found.add(email.toLowerCase());
+      });
+
+      // Match emails in text and raw HTML
+      const EMAIL_REGEX = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+      const textMatches = (text + ' ' + rawHtml).match(EMAIL_REGEX) || [];
+      textMatches.forEach(e => {
         if (isValidEmail(e)) found.add(e.toLowerCase());
       });
 
-      if (found.size > 0) break;
+      if (found.size > 0) break; // stop as soon as we find valid emails
     } catch { /* try next page */ }
   }
 
